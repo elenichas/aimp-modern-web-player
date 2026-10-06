@@ -1483,3 +1483,149 @@ input[type="range"]::-moz-range-thumb {
     scroll-behavior: auto !important;
   }
 }
+
+/* Extra native-inspired controls keep the compact BASIC layout intact. */
+.about-logo {
+  border: 0;
+  background: transparent;
+  color: #697f9b;
+  font-size: 30px;
+  padding: 0;
+  line-height: 1;
+}
+.eq-tabs > .eq-mode {
+  min-width: 64px !important;
+  padding-inline: 6px !important;
+  font-size: 11px !important;
+}
+.advanced-faders {
+  overflow-x: auto;
+  padding-bottom: 9px;
+}
+.advanced-faders .fader {
+  min-width: 27px;
+}
+.eq-controls:has(.advanced-faders) {
+  height: 170px;
+}
+.other-settings.effects-grid,
+.other-settings.settings-grid {
+  height: auto;
+  min-height: 150px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 20px;
+  align-items: center;
+  padding: 6px 9px 12px;
+}
+.effects-grid .wide,
+.settings-grid .utility-grid,
+.settings-grid > p {
+  grid-column: 1 / -1;
+}
+.effects-grid p,
+.settings-grid p {
+  margin: 0;
+}
+.effects-grid label > span {
+  width: 55px;
+  flex-shrink: 0;
+}
+.effects-grid input[type="range"] {
+  width: 0;
+  min-width: 20px;
+}
+.effects-grid output {
+  width: 40px;
+  flex-shrink: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.utility-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.utility-grid .pill {
+  min-width: 0;
+  width: 100%;
+  white-space: normal;
+}
+.preset-entry {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.preset-entry > button:first-child {
+  flex: 1;
+  overflow-wrap: anywhere;
+  height: auto;
+  min-height: 24px;
+  white-space: normal;
+}
+.modal-content input:not([type="range"]),
+.modal-content select {
+  max-width: 100%;
+  padding: 6px;
+  margin: 8px 6px;
+}
+.modal-content li {
+  margin-block: 9px;
+}
+@media (max-width: 600px) {
+  .about-logo {
+    font-size: 23px;
+  }
+  .eq-tabs {
+    gap: 4px;
+    padding-inline: 8px;
+  }
+  .eq-tabs > button:not(.collapse-eq) {
+    min-width: 0;
+    padding-inline: 6px;
+  }
+  .eq-tabs > .eq-mode {
+    min-width: 45px !important;
+    font-size: 9px !important;
+  }
+  .other-settings.effects-grid {
+    grid-template-columns: 1fr;
+  }
+  .other-settings.effects-grid,
+  .other-settings.settings-grid {
+    gap: 10px;
+    padding: 6px 2px 12px;
+  }
+  .utility-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .effects-grid label {
+    font-size: 11px;
+  }
+  .advanced-faders .fader {
+    min-width: 27px;
+  }
+}
+.volume {
+  min-width: 0;
+}
+.volume input {
+  width: 0;
+  flex: 1;
+}
+.config,
+.about-logo {
+  flex-shrink: 0;
+}
+@media (max-width: 350px) {
+  .transport-row {
+    flex-wrap: wrap;
+  }
+  .transport {
+    width: 100%;
+    justify-content: center;
+  }
+  .volume {
+    min-width: 90px;
+  }
+}

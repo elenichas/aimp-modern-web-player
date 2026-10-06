@@ -1,16 +1,23 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { AudioEngine, createDemoTracks } from "./audio";
+import { AudioEngine, createDemoTracks, calculateEQResponse } from "./audio";
 import {
   EQ_PRESETS,
   EQ_FREQUENCIES,
   formatTime,
-  nextTrackIndex,
+  BASIC_EQ_INDICES,
+  getPresetName,
 } from "./model";
 import type { Track } from "./model";
+import { PlaybackSequence } from "./sequencing";
 import "./style.css";
 
-import { defaults, parseSettings } from "./settings";
+import {
+  defaults,
+  parseSettings,
+  MAX_USER_PRESETS,
+  sanitizePresetName,
+} from "./settings";
 import type { Settings } from "./settings";
 function readSettings(): Settings {
   try {
@@ -96,6 +103,7 @@ function App() {
   const [elapsed, setElapsed] = useState(0);
   const [duration, setDuration] = useState(0);
   const [settings, setSettings] = useState(readSettings);
+  const [storageAvailable, setStorageAvailable] = useState(true);
   const [eqVisible, setEqVisible] = useState(true);
   const [playlistVisible, setPlaylistVisible] = useState(true);
   const [collapsed, setCollapsed] = useState(false);
@@ -105,7 +113,23 @@ function App() {
   const [notice, setNotice] = useState("Ready. Press play to begin.");
   const [dragging, setDragging] = useState(false);
   const [search, setSearch] = useState("");
-  const [preset, setPreset] = useState("Flat");
+  const [presetName, setPresetName] = useState("");
+  const [response, setResponse] = useState<number[]>([]);
+  const [loopA, setLoopA] = useState<number | null>(null);
+  const [loopB, setLoopB] = useState<number | null>(null);
+  const [sleepUntil, setSleepUntil] = useState<number | null>(null);
+  const [clockNow, setClockNow] = useState(Date.now());
+  const preset = getPresetName(settings.gains, settings.preamp, {
+    ...EQ_PRESETS,
+    ...settings.userPresets,
+  });
+  const sequence = useRef(new PlaybackSequence());
+  const frequencies = Array.from(
+    { length: 120 },
+    (_, i) => 20 * (20000 / 20) ** (i / 119),
+  );
+  const loop = useRef({ a: loopA, b: loopB });
+  loop.current = { a: loopA, b: loopB };
   const input = useRef<HTMLInputElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const urls = useRef<string[]>([]);
@@ -114,6 +138,13 @@ function App() {
   const playRequest = useRef(0);
   const track = tracks[current];
   const update = (s: Partial<Settings>) => setSettings((v) => ({ ...v, ...s }));
+  useEffect(() => {
+    sequence.current.sync(
+      tracks.map((t) => t.id),
+      tracks[current]?.id ?? null,
+      settings.shuffle,
+    );
+  }, [tracks, current, settings.shuffle]);
   useEffect(() => {
     urls.current.push(
       ...tracks.filter((t) => t.source === "demo").map((t) => t.url),
@@ -126,14 +157,24 @@ function App() {
   useEffect(() => {
     try {
       localStorage.setItem("modern-player-settings", JSON.stringify(settings));
+      setStorageAvailable(true);
     } catch {
-      /* Storage may be unavailable in private mode. */
+      setStorageAvailable(false);
     }
     engine.setVolume(settings.volume);
     engine.setMuted(settings.muted);
     engine.setEQ(settings.gains, settings.preamp, settings.eq);
     engine.setBalance(settings.balance);
-    engine.setEcho(settings.echo);
+    engine.setEffects(settings);
+    setResponse(
+      calculateEQResponse(
+        frequencies,
+        settings.gains,
+        settings.preamp,
+        settings.eq,
+        engine.sampleRate,
+      ),
+    );
   }, [settings, engine]);
   const play = async () => {
     if (!state.current.tracks.length) {
@@ -143,6 +184,16 @@ function App() {
     const request = ++playRequest.current;
     try {
       await engine.play();
+      const activeSettings = state.current.settings;
+      setResponse(
+        calculateEQResponse(
+          frequencies,
+          activeSettings.gains,
+          activeSettings.preamp,
+          activeSettings.eq,
+          engine.sampleRate,
+        ),
+      );
       if (request === playRequest.current) setNotice("");
     } catch {
       if (request === playRequest.current) {
@@ -155,28 +206,58 @@ function App() {
   };
   const select = (index: number, autoplay = true) => {
     if (index < 0 || index >= state.current.tracks.length) return;
+    state.current.current = index;
+    sequence.current.sync(
+      state.current.tracks.map((item) => item.id),
+      state.current.tracks[index].id,
+      state.current.settings.shuffle,
+    );
     setCurrent(index);
+    setLoopA(null);
+    setLoopB(null);
+    loop.current = { a: null, b: null };
     setElapsed(0);
     const t = state.current.tracks[index];
     engine.load(t.url);
     setDuration(t.duration);
     if (autoplay) void play();
   };
-  const advance = (direction = 1) => {
+  const advance = (direction = 1, wrap = true) => {
     const s = state.current;
-    if (!s.tracks.length) return;
-    select(
-      direction < 0
-        ? (s.current - 1 + s.tracks.length) % s.tracks.length
-        : nextTrackIndex(s.current, s.tracks.length, s.settings.shuffle),
+    if (!s.tracks.length) return false;
+    sequence.current.sync(
+      s.tracks.map((t) => t.id),
+      s.tracks[s.current]?.id ?? null,
+      s.settings.shuffle,
     );
+    const id =
+      direction < 0
+        ? sequence.current.previous(wrap)
+        : sequence.current.next(wrap);
+    if (id !== null) {
+      select(s.tracks.findIndex((t) => t.id === id));
+      return true;
+    }
+    return false;
   };
   useEffect(() => {
     if (tracks[0]) engine.load(tracks[0].url);
     const a = engine.audio;
-    const time = () => setElapsed(a.currentTime);
+    const time = () => {
+      const { a: start, b: end } = loop.current;
+      if (start !== null && end !== null && a.currentTime >= end)
+        a.currentTime = start;
+      setElapsed(a.currentTime);
+    };
     const metadata = () => {
-      setDuration(Number.isFinite(a.duration) ? a.duration : 0);
+      const knownDuration = Number.isFinite(a.duration) ? a.duration : 0;
+      setDuration(knownDuration);
+      if (knownDuration > 0)
+        setTracks((list) =>
+          list.map((t) =>
+            t.url === a.src ? { ...t, duration: knownDuration } : t,
+          ),
+        );
     };
     const start = () => setPlaying(true);
     const pause = () => setPlaying(false);
@@ -188,14 +269,17 @@ function App() {
     };
     const end = () => {
       const s = state.current;
-      if (s.settings.repeat) {
+      if (loop.current.a !== null && loop.current.b !== null) {
+        a.currentTime = loop.current.a;
+        void play();
+      } else if (s.settings.repeat) {
         a.currentTime = 0;
         void play();
-      } else if (s.settings.shuffle || s.current < s.tracks.length - 1)
-        advance();
-      else {
+      } else if (!advance(1, s.settings.repeatPlaylist)) {
+        engine.stop();
         setPlaying(false);
-        a.currentTime = 0;
+        setElapsed(0);
+        setNotice("End of playlist.");
       }
     };
     a.addEventListener("timeupdate", time);
@@ -221,6 +305,10 @@ function App() {
         const ctx = el.getContext("2d");
         if (ctx) {
           ctx.clearRect(0, 0, el.width, el.height);
+          if (!settings.visual) {
+            frame = requestAnimationFrame(draw);
+            return;
+          }
           const data = new Uint8Array(
             engine.analyser?.frequencyBinCount || 128,
           );
@@ -248,16 +336,21 @@ function App() {
   }, [engine, playing, settings.visual]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenu(null);
+        setDialog(null);
+        return;
+      }
       const tag = (e.target as HTMLElement).tagName;
-      if (["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(tag) || dialog)
+      if (
+        ["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(tag) ||
+        dialog ||
+        (e.target as HTMLElement).isContentEditable
+      )
         return;
       if (e.code === "Space") {
         e.preventDefault();
         playing ? engine.pause() : void play();
-      }
-      if (e.key === "Escape") {
-        setMenu(null);
-        setDialog(null);
       }
     };
     window.addEventListener("keydown", key);
@@ -348,6 +441,9 @@ function App() {
     const empty = state.current.tracks.length === 0;
     setTracks((v) => [...v, ...imported]);
     if (empty) {
+      setLoopA(null);
+      setLoopB(null);
+      loop.current = { a: null, b: null };
       setCurrent(0);
       engine.load(imported[0].url);
       setDuration(imported[0].duration);
@@ -361,6 +457,9 @@ function App() {
     const index = s.tracks.findIndex((t) => t.id === id);
     const remaining = s.tracks.filter((t) => t.id !== id);
     if (index === s.current) {
+      setLoopA(null);
+      setLoopB(null);
+      loop.current = { a: null, b: null };
       engine.stop();
       setElapsed(0);
       const next = Math.min(index, remaining.length - 1);
@@ -376,73 +475,187 @@ function App() {
     }
   };
   const applyPreset = (name: string) => {
-    const p = EQ_PRESETS[name];
+    const p = EQ_PRESETS[name] || settings.userPresets[name];
     if (p) {
       update({ gains: [...p.gains], preamp: p.preamp });
-      setPreset(name);
     }
   };
+  const showPanel = (name: string) => {
+    setCollapsed(false);
+    setEqVisible(true);
+    setTab(name);
+  };
+  const stop = () => {
+    engine.stop();
+    setElapsed(0);
+    setNotice("Stopped.");
+  };
+  const setAB = () => {
+    if (loopA === null) {
+      setLoopA(elapsed);
+      setNotice(`A set at ${formatTime(elapsed)}. Set B later in the track.`);
+    } else if (loopB === null && elapsed > loopA + 0.25) {
+      setLoopB(elapsed);
+      setNotice("A–B repeat enabled.");
+    } else if (loopB !== null) {
+      setLoopA(null);
+      setLoopB(null);
+      setNotice("A–B repeat cleared.");
+    } else setNotice("B must be after A. Seek or play forward first.");
+  };
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setClockNow(now);
+      if (sleepUntil !== null && now >= sleepUntil) {
+        engine.pause();
+        setSleepUntil(null);
+        setNotice("Sleep timer paused playback.");
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [sleepUntil, engine]);
   const menuActions: Record<string, { label: string; action: () => void }[]> = {
     File: [
-      { label: "Add audio files…", action: () => input.current?.click() },
-      { label: "Music library", action: () => setDialog("library") },
-      { label: "Clear playlist", action: () => setDialog("clear") },
+      { label: "Open audio files…", action: () => input.current?.click() },
+      { label: "View file info", action: () => setDialog("fileinfo") },
+      { label: "Clear session playlist…", action: () => setDialog("clear") },
+      {
+        label: "Desktop-only file actions…",
+        action: () => setDialog("limits"),
+      },
     ],
     Play: [
-      {
-        label: playing ? "Pause" : "Play",
-        action: () => (playing ? engine.pause() : void play()),
-      },
-      { label: "Stop", action: () => engine.stop() },
-      { label: "Next track", action: () => advance() },
-      {
-        label: `${settings.shuffle ? "✓ " : ""}Shuffle`,
-        action: () => update({ shuffle: !settings.shuffle }),
-      },
+      { label: "Play", action: () => void play() },
+      { label: "Pause", action: () => engine.pause() },
+      { label: "Stop", action: stop },
+      { label: "Next", action: () => advance() },
+      { label: "Prev", action: () => advance(-1) },
       {
         label: `${settings.repeat ? "✓ " : ""}Repeat current track`,
         action: () => update({ repeat: !settings.repeat }),
       },
+      {
+        label: `${settings.repeatPlaylist ? "✓ " : ""}Repeat playlist`,
+        action: () => update({ repeatPlaylist: !settings.repeatPlaylist }),
+      },
+      {
+        label: `${settings.shuffle ? "✓ " : ""}Shuffle`,
+        action: () => update({ shuffle: !settings.shuffle }),
+      },
+      { label: "A–B repeat", action: setAB },
+      {
+        label: "Volume Down",
+        action: () => update({ volume: Math.max(0, settings.volume - 0.05) }),
+      },
+      {
+        label: `${settings.muted ? "✓ " : ""}Volume Mute`,
+        action: () => update({ muted: !settings.muted }),
+      },
+      {
+        label: "Volume Up",
+        action: () => update({ volume: Math.min(1, settings.volume + 0.05) }),
+      },
     ],
     Options: [
+      { label: "Skin settings", action: () => setDialog("skin") },
+      { label: "Hotkeys settings", action: () => setDialog("hotkeys") },
       {
-        label: "Equalizer presets",
-        action: () => {
-          setEqVisible(true);
-          setTab("equalizer");
-          setDialog("presets");
-        },
+        label: "Language / plugins / native options",
+        action: () => setDialog("limits"),
       },
       {
-        label: "Audio effects",
+        label: "Shutdown settings (sleep timer)",
         action: () => {
-          setEqVisible(true);
-          setTab("effect");
+          showPanel("settings");
+          setDialog("timer");
         },
       },
-      {
-        label: "Player settings",
-        action: () => {
-          setEqVisible(true);
-          setTab("settings");
-        },
-      },
+      { label: "Settings", action: () => showPanel("settings") },
     ],
     View: [
       {
         label: `${eqVisible ? "✓ " : ""}Equalizer`,
-        action: () => setEqVisible(!eqVisible),
+        action: () => {
+          setCollapsed(false);
+          setEqVisible(!eqVisible);
+        },
       },
       {
+        label: "DSP Manager / Sound Effect",
+        action: () => showPanel("effect"),
+      },
+      { label: "EQ Equalizer", action: () => showPanel("equalizer") },
+      {
         label: `${playlistVisible ? "✓ " : ""}Playlist`,
-        action: () => setPlaylistVisible(!playlistVisible),
+        action: () => {
+          setCollapsed(false);
+          setPlaylistVisible(!playlistVisible);
+        },
+      },
+      { label: "Music Library", action: () => setDialog("library") },
+      { label: "Start Search", action: () => setDialog("library") },
+      {
+        label: `${settings.visual ? "✓ " : ""}Visualization (LCD spectrum)`,
+        action: () => {
+          setCollapsed(false);
+          update({ visual: !settings.visual });
+        },
       },
       { label: "Compact player", action: () => setCollapsed(!collapsed) },
+      { label: "Other native views…", action: () => setDialog("limits") },
     ],
     Help: [
-      { label: "Using Modern", action: () => setDialog("help") },
-      { label: "About this player", action: () => setDialog("about") },
+      { label: "Help", action: () => setDialog("help") },
+      { label: "Skin Info", action: () => setDialog("skin") },
+      { label: "About", action: () => setDialog("about") },
     ],
+  };
+  const savePreset = () => {
+    const name = sanitizePresetName(presetName);
+    if (!name) {
+      setNotice(
+        "Choose a nonempty preset name that is not a factory or reserved name.",
+      );
+      return;
+    }
+    if (Object.hasOwn(EQ_PRESETS, name)) {
+      setNotice("Choose a different name from the built-in web presets.");
+      return;
+    }
+    if (Object.hasOwn(settings.userPresets, name)) {
+      setNotice(
+        "That preset already exists. Delete it first or choose a new name.",
+      );
+      return;
+    }
+    if (Object.keys(settings.userPresets).length >= MAX_USER_PRESETS) {
+      setNotice(
+        `You can save up to ${MAX_USER_PRESETS} presets. Delete one first.`,
+      );
+      return;
+    }
+    update({
+      userPresets: {
+        ...settings.userPresets,
+        [name]: { gains: [...settings.gains], preamp: settings.preamp },
+      },
+    });
+    setPresetName("");
+    setNotice(`Saved preset: ${name}`);
+  };
+  const titles: Record<string, string> = {
+    presets: "EQUALIZER PRESETS",
+    eqmenu: "EQUALIZER OPTIONS",
+    library: "MUSIC LIBRARY",
+    help: "USING MODERN",
+    clear: "CLEAR PLAYLIST",
+    fileinfo: "FILE INFORMATION",
+    timer: "SLEEP TIMER",
+    hotkeys: "HOTKEYS",
+    skin: "SKIN INFORMATION",
+    limits: "NATIVE FEATURES",
+    about: "ABOUT MODERN",
   };
   const total = tracks.reduce((a, t) => a + t.duration, 0);
   const size = tracks.reduce((a, t) => a + t.size, 0);
@@ -476,7 +689,16 @@ function App() {
       <div className={`player-stack ${dragging ? "dragging" : ""}`}>
         <section className="main-player chrome" aria-label="Music player">
           <header className="titlebar">
-            <span className="tiny-logo">◩</span>
+            <button
+              className="tiny-logo"
+              aria-label="Main menu"
+              onClick={(e) => {
+                e.stopPropagation();
+                setMenu(menu === "File" ? null : "File");
+              }}
+            >
+              ◩
+            </button>
             <span className="title-rail" />
             <h1>
               AIMP <b>MODERN</b>
@@ -533,12 +755,20 @@ function App() {
                     </div>
                     <div className="audio-info">
                       <div>
-                        <small>MODE</small>
-                        <b>LOCAL</b>
+                        <small>kHz</small>
+                        <b>{track?.source === "demo" ? "22.05" : "—"}</b>
                       </div>
                       <div>
-                        <b>STEREO</b>
-                        <b>{track?.format || "—"}</b>
+                        <b>{track?.source === "demo" ? "STEREO" : "CH —"}</b>
+                        <b
+                          title={
+                            track?.source === "local"
+                              ? "File extension; codec unverified"
+                              : "Generated PCM WAV"
+                          }
+                        >
+                          {track?.format || "—"}
+                        </b>
                       </div>
                     </div>
                     <canvas
@@ -647,7 +877,7 @@ function App() {
                           ? void play()
                           : name === "pause"
                             ? engine.pause()
-                            : (engine.stop(), setElapsed(0))
+                            : stop()
                   }
                 >
                   <Icon name={name} />
@@ -675,13 +905,21 @@ function App() {
             <button
               className="config"
               onClick={() => {
+                setCollapsed(false);
                 setEqVisible(!eqVisible);
                 setTab("equalizer");
               }}
               aria-label="Toggle configuration"
               aria-pressed={eqVisible}
             >
-              CONFIG<span className="logo-mark">△</span>
+              CONFIG
+            </button>
+            <button
+              className="about-logo"
+              aria-label="About player"
+              onClick={() => setDialog("about")}
+            >
+              △
             </button>
           </div>
         </section>
@@ -696,7 +934,9 @@ function App() {
                   AIMP EQUALIZER
                   <span>
                     {tab === "equalizer"
-                      ? "BASIC"
+                      ? settings.advanced
+                        ? "ENHANCED · 18 BANDS"
+                        : "BASIC"
                       : tab === "effect"
                         ? "DSP EFFECTS"
                         : "PREFERENCES"}
@@ -704,15 +944,15 @@ function App() {
                 </h2>
                 <div className="response">
                   <span>
-                    +12 dB
+                    +15 dB
                     <br />0 dB
                     <br />
-                    −12 dB
+                    −15 dB
                   </span>
                   <svg
                     viewBox="0 0 300 35"
                     preserveAspectRatio="none"
-                    aria-label="Equalizer response"
+                    aria-label="Calculated equalizer response, ±15 dB display, including preamp"
                   >
                     <line
                       x1="0"
@@ -723,8 +963,11 @@ function App() {
                       strokeWidth="1"
                     />
                     <polyline
-                      points={settings.gains
-                        .map((v, i) => `${(i * 300) / 9},${17.5 - v}`)
+                      points={response
+                        .map(
+                          (v, i) =>
+                            `${(i * 300) / 119},${17.5 - (Math.max(-15, Math.min(15, Number.isFinite(v) ? v : 0)) * 17.5) / 15}`,
+                        )
                         .join(" ")}
                       fill="none"
                       stroke="#374959"
@@ -740,7 +983,7 @@ function App() {
                       L <span>◁ ◇ ▷</span> R
                     </div>
                     <input
-                      aria-label="Stereo pan"
+                      aria-label="Stereo balance"
                       type="range"
                       min="-1"
                       max="1"
@@ -768,94 +1011,214 @@ function App() {
                       <span className={`led ${settings.eq ? "on" : ""}`} />
                       <button
                         className="pill"
-                        onClick={() => setDialog("presets")}
+                        onClick={() => setDialog("eqmenu")}
                       >
                         PRESETS
                       </button>
                       <button
                         className="pill"
-                        onClick={() => applyPreset("Flat")}
+                        onClick={() => setDialog("presets")}
                       >
-                        RESET EQ
+                        EQ PRES
                       </button>
                     </div>
                   </div>
-                  <div className={`faders ${settings.eq ? "" : "bypassed"}`}>
+                  <div
+                    className={`faders ${settings.advanced ? "advanced-faders" : ""} ${settings.eq ? "" : "bypassed"}`}
+                  >
                     <div className="fader preamp">
                       <input
                         aria-label="Preamp"
                         type="range"
-                        min="-12"
-                        max="12"
+                        min="-15"
+                        max="15"
                         step=".5"
                         value={settings.preamp}
                         onChange={(e) => {
                           update({ preamp: Number(e.target.value) });
-                          setPreset("Custom");
                         }}
                       />
                       <span>PREAMP</span>
                     </div>
                     <div className="db-scale">
-                      <span>+12</span>
+                      <span>+15</span>
                       <span>0 dB</span>
-                      <span>−12</span>
+                      <span>−15</span>
                     </div>
-                    {EQ_FREQUENCIES.map((hz, i) => (
-                      <div className="fader" key={hz}>
-                        <input
-                          aria-label={`${hz} Hz`}
-                          title={`${hz} Hz: ${settings.gains[i]} dB`}
-                          type="range"
-                          min="-12"
-                          max="12"
-                          step=".5"
-                          value={settings.gains[i]}
-                          onChange={(e) => {
-                            const gains = [...settings.gains];
-                            gains[i] = Number(e.target.value);
-                            update({ gains });
-                            setPreset("Custom");
-                          }}
-                        />
-                        <span>{hz >= 1000 ? `${hz / 1000}K` : hz}</span>
-                      </div>
-                    ))}
+                    {(settings.advanced
+                      ? EQ_FREQUENCIES.map((_, i) => i)
+                      : BASIC_EQ_INDICES
+                    ).map((i) => {
+                      const hz = EQ_FREQUENCIES[i];
+                      return (
+                        <div className="fader" key={hz}>
+                          <input
+                            aria-label={`${hz} Hz`}
+                            title={`${hz} Hz: ${settings.gains[i]} dB`}
+                            type="range"
+                            min="-15"
+                            max="15"
+                            step=".5"
+                            value={settings.gains[i]}
+                            onChange={(e) => {
+                              const gains = [...settings.gains];
+                              gains[i] = Number(e.target.value);
+                              update({ gains });
+                            }}
+                          />
+                          <span>{hz >= 1000 ? `${hz / 1000}K` : hz}</span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               ) : tab === "effect" ? (
-                <div className="other-settings">
-                  <div>
-                    <h3>STEREO ECHO</h3>
-                    <p>
-                      A little space for your sound. A real feedback delay,
-                      processed on your device.
-                    </p>
-                    <label>
-                      Dry
+                <div className="other-settings effects-grid">
+                  <p className="wide">
+                    Web Audio approximations, not AIMP DSP algorithms. Effect
+                    amounts are wet/dry mixes.
+                  </p>
+                  {(["echo", "reverb", "chorus", "flanger"] as const).map(
+                    (effect) => (
+                      <label key={effect}>
+                        <span>{effect.toUpperCase()}</span>
+                        <input
+                          aria-label={`${effect[0].toUpperCase() + effect.slice(1)} amount`}
+                          type="range"
+                          min="0"
+                          max="1"
+                          step=".01"
+                          value={settings[effect]}
+                          onChange={(e) =>
+                            update({ [effect]: Number(e.target.value) })
+                          }
+                        />
+                        <output aria-label={`${effect} value`}>
+                          {Math.round(settings[effect] * 100)}%
+                        </output>
+                      </label>
+                    ),
+                  )}
+                  {(["speed", "tempo"] as const).map((effect) => (
+                    <label key={effect}>
+                      <span>{effect.toUpperCase()}</span>
                       <input
-                        aria-label="Echo amount"
+                        aria-label={
+                          effect === "speed"
+                            ? "Speed with pitch"
+                            : "Tempo preserving pitch"
+                        }
                         type="range"
-                        min="0"
-                        max="1"
-                        step=".01"
-                        value={settings.echo}
+                        disabled={
+                          effect === "tempo" &&
+                          !engine.supportsPitchPreservation
+                        }
+                        min=".5"
+                        max="2"
+                        step=".05"
+                        value={settings[effect]}
                         onChange={(e) =>
-                          update({ echo: Number(e.target.value) })
+                          update({
+                            speed: 1,
+                            tempo: 1,
+                            [effect]: Number(e.target.value),
+                          })
                         }
                       />
-                      Wet <output>{Math.round(settings.echo * 100)}%</output>
+                      <output>{settings[effect].toFixed(2)}×</output>
                     </label>
-                  </div>
+                  ))}
+                  <p className="wide">
+                    {!engine.supportsPitchPreservation &&
+                      "Pitch preservation is unavailable here: Tempo is disabled and Speed uses browser-controlled pitch. "}
+                    Speed changes pitch when supported; Tempo requests browser
+                    pitch preservation. They are alternative modes. Independent
+                    Pitch, TrueBass and Enhancer require native DSP and are
+                    unavailable.
+                  </p>
                   <button
                     className="pill"
-                    onClick={() => update({ echo: 0, balance: 0 })}
+                    onClick={() =>
+                      update({
+                        echo: 0,
+                        reverb: 0,
+                        chorus: 0,
+                        flanger: 0,
+                        speed: 1,
+                        tempo: 1,
+                      })
+                    }
                   >
                     RESET EFFECTS
                   </button>
                 </div>
               ) : (
                 <div className="other-settings settings-grid">
+                  <div className="utility-grid">
+                    <button
+                      className="pill"
+                      onClick={() => setDialog("fileinfo")}
+                    >
+                      FILE INFO
+                    </button>
+                    <button className="pill" onClick={() => setDialog("timer")}>
+                      SLEEP TIMER
+                    </button>
+                    <button
+                      className="pill"
+                      onClick={() => setDialog("library")}
+                    >
+                      AUDIO LIBRARY
+                    </button>
+                    <button
+                      className="pill"
+                      onClick={() => setDialog("library")}
+                    >
+                      SEARCH
+                    </button>
+                    <button
+                      className="pill"
+                      onClick={() => setDialog("hotkeys")}
+                    >
+                      HOTKEYS
+                    </button>
+                    <button className="pill" onClick={setAB}>
+                      {loopB !== null
+                        ? "CLEAR A–B"
+                        : loopA !== null
+                          ? "SET B"
+                          : "SET A"}
+                    </button>
+                    <button className="pill" onClick={() => setDialog("skin")}>
+                      SKIN INFO
+                    </button>
+                    <button
+                      className="pill"
+                      onClick={() => setDialog("limits")}
+                    >
+                      NATIVE UTILITIES
+                    </button>
+                  </div>
+                  <p>
+                    A–B:{" "}
+                    {loopA === null
+                      ? "off"
+                      : `${formatTime(loopA)} → ${loopB === null ? "set B" : formatTime(loopB)}`}{" "}
+                    · Sleep:{" "}
+                    {sleepUntil === null
+                      ? "off"
+                      : formatTime((sleepUntil - clockNow) / 1000)}
+                  </p>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={settings.repeatPlaylist}
+                      onChange={(e) =>
+                        update({ repeatPlaylist: e.target.checked })
+                      }
+                    />{" "}
+                    Repeat playlist
+                  </label>
                   <label>
                     <input
                       type="checkbox"
@@ -864,23 +1227,20 @@ function App() {
                     />{" "}
                     Live spectrum visualization
                   </label>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={settings.repeat}
-                      onChange={(e) => update({ repeat: e.target.checked })}
-                    />{" "}
-                    Repeat current track
-                  </label>
                   <p>
-                    Audio preferences are saved in this browser. Local files are
-                    never uploaded and must be re-added after a refresh.
+                    {storageAvailable
+                      ? "Preferences and custom presets stay in this browser."
+                      : "Browser storage is unavailable; preferences last only this session."}{" "}
+                    Local audio is never uploaded and must be re-added after
+                    refresh.
                   </p>
                   <button
                     className="pill"
                     onClick={() => {
-                      setSettings({ ...defaults });
-                      setPreset("Flat");
+                      setSettings({ ...defaults, gains: [...defaults.gains] });
+                      setLoopA(null);
+                      setLoopB(null);
+                      setSleepUntil(null);
                     }}
                   >
                     RESTORE DEFAULTS
@@ -898,6 +1258,17 @@ function App() {
                   {t.toUpperCase()}
                 </button>
               ))}
+              <button
+                className="pill eq-mode"
+                aria-label="Toggle enhanced equalizer"
+                aria-pressed={settings.advanced}
+                onClick={() => {
+                  showPanel("equalizer");
+                  update({ advanced: !settings.advanced });
+                }}
+              >
+                {settings.advanced ? "BASIC EQ" : "ENH EQ"}
+              </button>
               <button
                 className="pill collapse-eq"
                 aria-label="Hide equalizer"
@@ -1024,17 +1395,7 @@ function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <header className="titlebar">
-              <h2>
-                {dialog === "presets"
-                  ? "EQUALIZER PRESETS"
-                  : dialog === "library"
-                    ? "MUSIC LIBRARY"
-                    : dialog === "help"
-                      ? "USING MODERN"
-                      : dialog === "clear"
-                        ? "CLEAR PLAYLIST"
-                        : "ABOUT MODERN"}
-              </h2>
+              <h2>{titles[dialog] || "MODERN"}</h2>
               <button
                 aria-label="Close dialog"
                 autoFocus
@@ -1044,23 +1405,191 @@ function App() {
               </button>
             </header>
             <div className="modal-content">
-              {dialog === "presets" ? (
+              {dialog === "presets" || dialog === "eqmenu" ? (
                 <>
-                  <p>Find your frequency. Current: {preset}</p>
-                  <div className="preset-grid">
-                    {Object.keys(EQ_PRESETS).map((name) => (
+                  <p>
+                    Current:{" "}
+                    <strong data-testid="current-preset">{preset}</strong>.
+                    Factory curves are custom web presets, not AIMP presets.
+                  </p>
+                  {dialog === "eqmenu" && (
+                    <div className="utility-grid">
                       <button
-                        className={`pill ${preset === name ? "active" : ""}`}
-                        key={name}
-                        onClick={() => {
-                          applyPreset(name);
-                          setDialog(null);
-                        }}
+                        className="pill"
+                        onClick={() => applyPreset("Flat")}
                       >
-                        {name}
+                        Reset EQ
                       </button>
+                      <button
+                        className="pill"
+                        onClick={() => update({ eq: !settings.eq })}
+                      >
+                        {settings.eq ? "Bypass EQ" : "Enable EQ"}
+                      </button>
+                      <button
+                        className="pill"
+                        onClick={() => setDialog("presets")}
+                      >
+                        Choose preset
+                      </button>
+                    </div>
+                  )}
+                  <div className="preset-grid">
+                    {Object.keys({
+                      ...EQ_PRESETS,
+                      ...settings.userPresets,
+                    }).map((name) => (
+                      <div className="preset-entry" key={name}>
+                        <button
+                          className={`pill ${preset === name ? "active" : ""}`}
+                          onClick={() => applyPreset(name)}
+                        >
+                          {name}
+                        </button>
+                        {Object.hasOwn(settings.userPresets, name) && (
+                          <button
+                            className="pill"
+                            aria-label={`Delete preset ${name}`}
+                            onClick={() => {
+                              const saved = { ...settings.userPresets };
+                              delete saved[name];
+                              update({ userPresets: saved });
+                            }}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
                     ))}
                   </div>
+                  <label>
+                    Preset name{" "}
+                    <input
+                      aria-label="Preset name"
+                      maxLength={48}
+                      value={presetName}
+                      onChange={(e) => setPresetName(e.target.value)}
+                    />
+                  </label>
+                  <button className="pill" onClick={savePreset}>
+                    Save current preset
+                  </button>
+                  <p role="status">{notice}</p>
+                  <p>
+                    All 18 bands and preamp are saved. Switching BASIC/ENHANCED
+                    changes which bands are shown, not the sound. Positive
+                    boosts can clip; lower the preamp for headroom.
+                  </p>
+                </>
+              ) : dialog === "fileinfo" ? (
+                <>
+                  <h3>{track?.title || "No track selected"}</h3>
+                  <p>
+                    {track?.artist} ·{" "}
+                    {formatTime(duration || track?.duration || 0)} ·{" "}
+                    {((track?.size || 0) / 1024 / 1024).toFixed(2)} MiB
+                  </p>
+                  <p>
+                    {track?.source === "demo"
+                      ? "Generated PCM WAV · 22.05 kHz · 16 bit · stereo · 705.6 kbps"
+                      : `File extension: ${track?.format || "unknown"}. Codec, channel count, sample rate and embedded tags are not verified by this browser player.`}
+                  </p>
+                  <p>
+                    Read-only information. Native tag editing and audio
+                    conversion are unavailable.
+                  </p>
+                </>
+              ) : dialog === "timer" ? (
+                <>
+                  <p>
+                    Pause playback after the selected time. This does not shut
+                    down your device. Background browser suspension may delay
+                    the timer.
+                  </p>
+                  <label>
+                    Sleep timer{" "}
+                    <select
+                      aria-label="Sleep timer"
+                      value={sleepUntil === null ? "off" : "active"}
+                      onChange={(e) => {
+                        if (e.target.value === "off") setSleepUntil(null);
+                        else if (e.target.value !== "active")
+                          setSleepUntil(
+                            Date.now() + Number(e.target.value) * 60000,
+                          );
+                      }}
+                    >
+                      <option value="off">Off</option>
+                      {sleepUntil !== null && (
+                        <option value="active">
+                          {formatTime((sleepUntil - clockNow) / 1000)} remaining
+                        </option>
+                      )}
+                      {[5, 15, 30, 60, 90].map((n) => (
+                        <option key={n} value={n}>
+                          {n} minutes
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <p>The timer is session-only and clears on reload.</p>
+                </>
+              ) : dialog === "hotkeys" ? (
+                <>
+                  <p>
+                    Space: play / pause. Escape: dismiss menus or dialogs. Tab:
+                    move between controls. Arrow keys: adjust a focused slider.
+                  </p>
+                  <p>
+                    Shortcuts apply only while this page is focused. Global
+                    desktop hotkeys and custom key bindings are unavailable.
+                  </p>
+                </>
+              ) : dialog === "skin" ? (
+                <>
+                  <h3>AIMP Modern, browser adaptation</h3>
+                  <p>
+                    Inspired by memo-se’s Modern Advanced &amp; Basic skin.
+                    BASIC maps native bands 2, 4, 6, 8, 9, 10, 12, 14, 16 and
+                    18. The photographed Band 9 label is interpreted as 700 Hz;
+                    the exact historical build and native filter curves remain
+                    unverified.
+                  </p>
+                  <p>
+                    Use ENH EQ for all 18 bands, or BASIC EQ to return. Native
+                    OS window settings, alternative skins and language packs are
+                    unavailable.
+                  </p>
+                </>
+              ) : dialog === "limits" ? (
+                <>
+                  <p>
+                    This browser edition keeps your audio local. These original
+                    native features are not implemented:
+                  </p>
+                  <ul>
+                    <li>
+                      Radio capture, Open URL, tag editor and audio converter
+                    </li>
+                    <li>
+                      Native DSP plugins, independent Pitch, TrueBass, Enhancer,
+                      normalization, cross-mixing and silence removal
+                    </li>
+                    <li>
+                      OS shutdown, stay-on-top, minimize/maximize and
+                      application exit
+                    </li>
+                    <li>
+                      Language packs, lyrics and cover-art panes, persistent
+                      indexed library and multi-playlist management
+                    </li>
+                    <li>Folder import and playlist file import/export</li>
+                  </ul>
+                  <p>
+                    Available counterparts: file info, session library/search,
+                    A–B repeat, a playback sleep timer, and browser effects.
+                    They do not claim native equivalence.
+                  </p>
                 </>
               ) : dialog === "library" ? (
                 <>
@@ -1122,6 +1651,9 @@ function App() {
                       engine.stop();
                       urls.current.forEach(URL.revokeObjectURL);
                       urls.current = [];
+                      setLoopA(null);
+                      setLoopB(null);
+                      loop.current = { a: null, b: null };
                       setTracks([]);
                       setCurrent(0);
                       setDuration(0);
@@ -1142,8 +1674,9 @@ function App() {
                   </p>
                   <p>
                     Space plays or pauses. Select a playlist row to play it. The
-                    seek bar, volume, stereo pan, 10-band equalizer and echo
-                    effect control real audio.
+                    seek bar, volume, stereo balance, 18-band equalizer and
+                    browser effects control real audio. BASIC exposes ten of the
+                    eighteen bands.
                   </p>
                   <p>
                     MP3 and WAV work in most browsers. FLAC, AAC/M4A, OGG and
@@ -1152,9 +1685,9 @@ function App() {
                     come from filenames; embedded tags are not read.
                   </p>
                   <p>
-                    Repeat loops the current track. Shuffle chooses a different
-                    track when possible. At the end of the normal playlist,
-                    playback stops.
+                    Repeat loops the current track. Shuffle uses nonrepeating
+                    playlist cycles; Previous retraces listening history. At the
+                    end of the normal playlist, playback stops.
                   </p>
                   <p>
                     Preferences stay in this browser. Imported audio stays
