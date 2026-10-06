@@ -2,6 +2,10 @@
 
 A working React + TypeScript music player inspired by the supplied silver-and-blue AIMP Modern desktop skin. Independent and unofficial; no affiliation with AIMP or Winamp.
 
+## Live app
+
+[Open the private player](https://aimp-modern-web-player.eleni-133.chatgpt.site). Access is restricted to the owner.
+
 ## Run locally
 
 Requires Node.js 22.12+ (or Node.js 24+). The current test toolchain requires a supported modern Node.js release.
@@ -57,4 +61,4 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-The Playwright suite covers real browser playback, seeking, repeated track changes, EQ and echo controls, dialog dismissal, library search, panel restoration and mobile overflow. Unit tests and the production build were run successfully in the build environment. Local browser launch is restricted in the build environment, so browser verification runs in GitHub Actions. The first CI run passed the mobile/library/dialog test and exposed an ambiguous Play-button selector in the playback test. That selector is corrected; the next CI run verifies the playback flow. Desktop and mobile screenshots are saved in Playwright test output for visual review.
+The Playwright suite covers real browser playback, seeking, repeated track changes, EQ and echo controls, dialog dismissal, library search, panel restoration and mobile overflow. Unit tests and the production build were run successfully in the build environment. Local browser launch is restricted in the build environment, so browser verification runs in GitHub Actions. Both browser tests passed in [GitHub Actions run 37526695864](https://github.com/elenichas/aimp-modern-web-player/actions/runs/37526695864), alongside all 20 unit tests, type checking and the production build. The desktop and mobile captures were visually reviewed. This verifies Chromium behavior; real iOS/Safari playback remains device-dependent. Desktop and mobile screenshots are saved in Playwright test output for visual review.
