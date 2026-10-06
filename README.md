@@ -4,7 +4,7 @@ A working React + TypeScript music player inspired by the supplied silver-and-bl
 
 ## Run locally
 
-Requires Node.js 20.19+ or 22.12+.
+Requires Node.js 22.12+ (or Node.js 24+). The current test toolchain requires a supported modern Node.js release.
 
 ```sh
 npm install
@@ -57,4 +57,4 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-The Playwright suite covers real browser playback, seeking, repeated track changes, EQ and echo controls, dialog dismissal, library search, panel restoration and mobile overflow. Unit tests and the production build were run successfully in the build environment. Browser tests could not be run there because Chromium process startup was blocked by the execution environment's socket restrictions; they are provided for a browser-capable environment.
+The Playwright suite covers real browser playback, seeking, repeated track changes, EQ and echo controls, dialog dismissal, library search, panel restoration and mobile overflow. Unit tests and the production build were run successfully in the build environment. Local browser launch is restricted in the build environment, so browser verification runs in GitHub Actions. The first CI run passed the mobile/library/dialog test and exposed an ambiguous Play-button selector in the playback test. That selector is corrected; the next CI run verifies the playback flow. Desktop and mobile screenshots are saved in Playwright test output for visual review.

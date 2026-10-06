@@ -2,15 +2,23 @@ import { test, expect } from "@playwright/test";
 
 test("plays, seeks, applies EQ and effects, and survives repeated track changes", async ({
   page,
-}) => {
+}, testInfo) => {
+  await page.setViewportSize({ width: 1200, height: 1100 });
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
   await expect(page.locator(".track")).toHaveCount(3);
   await expect(page.locator(".digital")).toHaveText("00:00");
-  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await page
+    .locator(".transport")
+    .getByRole("button", { name: "Play", exact: true })
+    .click();
   await expect(page.locator(".under-player")).toContainText("Playing locally");
   await expect(page.locator(".digital")).not.toHaveText("00:00");
+  await page.screenshot({
+    path: testInfo.outputPath("desktop-player.png"),
+    fullPage: true,
+  });
   await page.getByRole("slider", { name: "Seek", exact: true }).fill("10");
   await expect(page.locator(".digital")).toContainText("0:1");
   await page.getByRole("slider", { name: "1000 Hz", exact: true }).fill("6");
@@ -32,7 +40,7 @@ test("plays, seeks, applies EQ and effects, and survives repeated track changes"
 
 test("library search, dialog dismissal, panel restoration and mobile fit", async ({
   page,
-}) => {
+}, testInfo) => {
   await page.setViewportSize({ width: 375, height: 900 });
   await page.goto("/");
   await page
@@ -55,4 +63,8 @@ test("library search, dialog dismissal, panel restoration and mobile fit", async
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
   ).toBe(true);
+  await page.screenshot({
+    path: testInfo.outputPath("mobile-player.png"),
+    fullPage: true,
+  });
 });
