@@ -28,7 +28,7 @@ test("plays, seeks, applies EQ and effects, and survives repeated track changes"
   ).toHaveAttribute("aria-pressed", "false");
   await page.getByRole("button", { name: "Enable equalizer" }).click();
   await page.getByRole("button", { name: "EFFECT", exact: true }).click();
-  await page.getByRole("slider", { name: "Echo amount" }).fill(".4");
+  await page.getByRole("slider", { name: "Echo amount" }).fill("0.4");
   await expect(page.locator("output")).toHaveText("40%");
   for (let index = 0; index < 6; index++)
     await page.getByRole("button", { name: "Next track", exact: true }).click();
